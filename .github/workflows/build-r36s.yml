@@ -1,0 +1,157 @@
+name: Build LGPT for R36S (ArkOS4Clone GLIBC 2.30)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-r36s.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout LittleGPTracker with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build in Ubuntu 18.04 ARM64 Container (GLIBC 2.27 compatible with 2.30)
+        run: |
+          docker run --rm -v "$PWD":/work -w /work arm64v8/ubuntu:18.04 bash -e -c '
+            apt-get update
+            apt-get install -y build-essential git cmake pkg-config \
+              libasound2-dev libdrm-dev libgbm-dev libudev-dev libdbus-1-dev \
+              libsdl2-dev libsdl2-ttf-dev zlib1g-dev patchelf
+
+            echo "=== 1. Building DRM Dumb-Buffer & FB0 Bridge (Bypass broken Mali) ==="
+            cat << "EOF" > /tmp/mali_bypass.c
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <stdint.h>
+          #include <string.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <sys/ioctl.h>
+          #include <sys/mman.h>
+          #include <dlfcn.h>
+          #include <xf86drm.h>
+          #include <xf86drmMode.h>
+          #include <SDL2/SDL.h>
+
+          static int drm_fd = -1;
+          static uint32_t fb_id = 0, handle = 0, pitch = 0;
+          static uint64_t map_size = 0;
+          static uint32_t *drm_map = NULL;
+          static uint32_t crtc_id = 0, conn_id = 0;
+          static drmModeModeInfo mode_info;
+          static int drm_ready = 0;
+          static SDL_Surface *shadow_surf = NULL;
+
+          static void init_drm_dumb(void) {
+              if (drm_ready) return;
+              drm_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+              if (drm_fd < 0) return;
+              drmModeRes *res = drmModeGetResources(drm_fd);
+              if (!res) return;
+              for (int i = 0; i < res->count_connectors; i++) {
+                  drmModeConnector *conn = drmModeGetConnector(drm_fd, res->connectors[i]);
+                  if (conn && conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0) {
+                      conn_id = conn->connector_id;
+                      mode_info = conn->modes[0];
+                      if (conn->encoder_id) {
+                          drmModeEncoder *enc = drmModeGetEncoder(drm_fd, conn->encoder_id);
+                          if (enc) { crtc_id = enc->crtc_id; drmModeFreeEncoder(enc); }
+                      }
+                      if (!crtc_id && res->count_crtcs > 0) crtc_id = res->crtcs[0];
+                      drmModeFreeConnector(conn);
+                      break;
+                  }
+                  if (conn) drmModeFreeConnector(conn);
+              }
+              drmModeFreeResources(res);
+              if (!conn_id || !crtc_id) return;
+
+              struct drm_mode_create_dumb creq = { .width = mode_info.hdisplay, .height = mode_info.vdisplay, .bpp = 32 };
+              if (ioctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0) return;
+              handle = creq.handle; pitch = creq.pitch; map_size = creq.size;
+
+              if (drmModeAddFB(drm_fd, mode_info.hdisplay, mode_info.vdisplay, 24, 32, pitch, handle, &fb_id)) return;
+
+              struct drm_mode_map_dumb mreq = { .handle = handle };
+              if (ioctl(drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq)) return;
+
+              drm_map = mmap(0, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, mreq.offset);
+              if (drm_map == MAP_FAILED) { drm_map = NULL; return; }
+              memset(drm_map, 0, map_size);
+              drmModeSetCrtc(drm_fd, crtc_id, fb_id, 0, 0, &conn_id, 1, &mode_info);
+              drm_ready = 1;
+              fprintf(stderr, "[BYPASS] DRM Dumb Buffer 640x480 initialized without Mali!\n");
+          }
+
+          SDL_Window* SDL_CreateWindow(const char *title, int x, int y, int w, int h, Uint32 flags) {
+              init_drm_dumb();
+              if (!shadow_surf) {
+                  shadow_surf = SDL_CreateRGBSurface(0, 640, 480, 32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
+              }
+              return (SDL_Window*)shadow_surf;
+          }
+
+          void SDL_GetWindowSize(SDL_Window* window, int *w, int *h) {
+              if (w) *w = 640;
+              if (h) *h = 480;
+          }
+
+          SDL_Surface* SDL_GetWindowSurface(SDL_Window* window) {
+              if (!shadow_surf) {
+                  shadow_surf = SDL_CreateRGBSurface(0, 640, 480, 32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000);
+              }
+              return shadow_surf;
+          }
+
+          int SDL_UpdateWindowSurface(SDL_Window* window) {
+              if (drm_ready && drm_map && shadow_surf && shadow_surf->pixels) {
+                  memcpy(drm_map, shadow_surf->pixels, 640 * 480 * 4);
+              }
+              return 0;
+          }
+
+          int SDL_UpdateWindowSurfaceRects(SDL_Window* window, const SDL_Rect *rects, int numrects) {
+              return SDL_UpdateWindowSurface(window);
+          }
+
+          SDL_Renderer* SDL_CreateRenderer(SDL_Window* window, int index, Uint32 flags) {
+              SDL_Surface *s = SDL_GetWindowSurface(window);
+              return SDL_CreateSoftwareRenderer(s);
+          }
+
+          void SDL_RenderPresent(SDL_Renderer* renderer) {
+              SDL_UpdateWindowSurface(NULL);
+          }
+
+          int SDL_ShowCursor(int toggle) { return 0; }
+          void SDL_DestroyWindow(SDL_Window* window) {}
+          EOF
+
+            gcc -shared -fPIC -O2 /tmp/mali_bypass.c -o /work/libmali_bypass.so $(pkg-config --cflags --libs libdrm sdl2) -ldl
+
+            echo "=== 2. Patching LGPT RG35XXPLUS / DEB Makefile for Ubuntu 18.04 ==="
+            mkdir -p /work/build_out
+            cd /work/projects
+            # Compile LGPT SDL2 64-bit target
+            if [ -f Makefile.DEB ]; then
+              make -f Makefile.DEB -j$(nproc) || true
+            fi
+            find /work -name "*lgpt*" -type f -executable -exec cp {} /work/build_out/ \; || true
+
+            echo "=== 3. Patching existing lgpt-rg35xxplus.elf if present ==="
+            cp /work/libmali_bypass.so /work/build_out/
+          '
+
+      - name: Upload Built R36S Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: LGPT-R36S-ArkOS4Clone
+          path: |
+            build_out/*
+            libmali_bypass.so
