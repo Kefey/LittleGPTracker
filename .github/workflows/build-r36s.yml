@@ -15,15 +15,12 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Build in Ubuntu 18.04 ARM64 Container (GLIBC 2.27 compatible with 2.30)
+      - name: Build in Ubuntu 18.04 ARM64 Container
         run: |
           docker run --rm -v "$PWD":/work -w /work arm64v8/ubuntu:18.04 bash -e -c '
             apt-get update
-            apt-get install -y build-essential git cmake pkg-config \
-              libasound2-dev libdrm-dev libgbm-dev libudev-dev libdbus-1-dev \
-              libsdl2-dev libsdl2-ttf-dev zlib1g-dev patchelf
+            apt-get install -y build-essential pkg-config libdrm-dev libsdl2-dev
 
-            echo "=== 1. Building DRM Dumb-Buffer & FB0 Bridge (Bypass broken Mali) ==="
             cat << "EOF" > /tmp/mali_bypass.c
           #define _GNU_SOURCE
           #include <stdio.h>
@@ -47,6 +44,9 @@ jobs:
           static drmModeModeInfo mode_info;
           static int drm_ready = 0;
           static SDL_Surface *shadow_surf = NULL;
+
+          static SDL_Surface* (*real_CreateRGBSurface)(Uint32, int, int, int, Uint32, Uint32, Uint32, Uint32) = NULL;
+          static SDL_Surface* (*real_CreateRGBSurfaceWithFormat)(Uint32, int, int, int, Uint32) = NULL;
 
           static void init_drm_dumb(void) {
               if (drm_ready) return;
@@ -86,13 +86,59 @@ jobs:
               memset(drm_map, 0, map_size);
               drmModeSetCrtc(drm_fd, crtc_id, fb_id, 0, 0, &conn_id, 1, &mode_info);
               drm_ready = 1;
-              fprintf(stderr, "[BYPASS] DRM Dumb Buffer 640x480 initialized without Mali!\n");
+              fprintf(stderr, "[BYPASS] DRM Dumb Buffer 640x480 (32bpp RGB888) initialized!\n");
+          }
+
+          static void ensure_real_funcs(void) {
+              if (!real_CreateRGBSurface)
+                  real_CreateRGBSurface = dlsym(RTLD_NEXT, "SDL_CreateRGBSurface");
+              if (!real_CreateRGBSurfaceWithFormat)
+                  real_CreateRGBSurfaceWithFormat = dlsym(RTLD_NEXT, "SDL_CreateRGBSurfaceWithFormat");
+          }
+
+          // Исправляем Screen (0,0) Bpp:0 -> сообщаем LGPT точный формат экрана 640x480 32bpp!
+          int SDL_GetDesktopDisplayMode(int displayIndex, SDL_DisplayMode *mode) {
+              if (mode) {
+                  mode->format = SDL_PIXELFORMAT_RGB888;
+                  mode->w = 640;
+                  mode->h = 480;
+                  mode->refresh_rate = 60;
+                  mode->driverdata = NULL;
+              }
+              return 0;
+          }
+
+          int SDL_GetCurrentDisplayMode(int displayIndex, SDL_DisplayMode *mode) {
+              return SDL_GetDesktopDisplayMode(displayIndex, mode);
+          }
+
+          // Гарантируем, что даже если LGPT передает depth=0 (из-за Bpp:0), поверхность шрифта создается как 32-битная!
+          SDL_Surface* SDL_CreateRGBSurface(Uint32 flags, int width, int height, int depth,
+                                            Uint32 Rmask, Uint32 Gmask, Uint32 Bmask, Uint32 Amask) {
+              ensure_real_funcs();
+              if (depth == 0) {
+                  depth = 32;
+                  if (!Rmask && !Gmask && !Bmask) {
+                      Rmask = 0x00FF0000; Gmask = 0x0000FF00; Bmask = 0x000000FF; Amask = 0;
+                  }
+              }
+              return real_CreateRGBSurface(flags, width, height, depth, Rmask, Gmask, Bmask, Amask);
+          }
+
+          SDL_Surface* SDL_CreateRGBSurfaceWithFormat(Uint32 flags, int width, int height, int depth, Uint32 format) {
+              ensure_real_funcs();
+              if (depth == 0 || format == 0) {
+                  depth = 32;
+                  format = SDL_PIXELFORMAT_RGB888;
+              }
+              return real_CreateRGBSurfaceWithFormat(flags, width, height, depth, format);
           }
 
           SDL_Window* SDL_CreateWindow(const char *title, int x, int y, int w, int h, Uint32 flags) {
+              ensure_real_funcs();
               init_drm_dumb();
               if (!shadow_surf) {
-                  shadow_surf = SDL_CreateRGBSurface(0, 640, 480, 32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0);
+                  shadow_surf = real_CreateRGBSurface(0, 640, 480, 32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0);
               }
               return (SDL_Window*)shadow_surf;
           }
@@ -102,9 +148,14 @@ jobs:
               if (h) *h = 480;
           }
 
+          Uint32 SDL_GetWindowPixelFormat(SDL_Window* window) {
+              return SDL_PIXELFORMAT_RGB888;
+          }
+
           SDL_Surface* SDL_GetWindowSurface(SDL_Window* window) {
+              ensure_real_funcs();
               if (!shadow_surf) {
-                  shadow_surf = SDL_CreateRGBSurface(0, 640, 480, 32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0);
+                  shadow_surf = real_CreateRGBSurface(0, 640, 480, 32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0);
               }
               return shadow_surf;
           }
@@ -134,24 +185,10 @@ jobs:
           EOF
 
             gcc -shared -fPIC -O2 /tmp/mali_bypass.c -o /work/libmali_bypass.so $(pkg-config --cflags --libs libdrm sdl2) -ldl
-
-            echo "=== 2. Patching LGPT RG35XXPLUS / DEB Makefile for Ubuntu 18.04 ==="
-            mkdir -p /work/build_out
-            cd /work/projects
-            # Compile LGPT SDL2 64-bit target
-            if [ -f Makefile.DEB ]; then
-              make -f Makefile.DEB -j$(nproc) || true
-            fi
-            find /work -name "*lgpt*" -type f -executable -exec cp {} /work/build_out/ \; || true
-
-            echo "=== 3. Patching existing lgpt-rg35xxplus.elf if present ==="
-            cp /work/libmali_bypass.so /work/build_out/
           '
 
       - name: Upload Built R36S Package
         uses: actions/upload-artifact@v4
         with:
           name: LGPT-R36S-ArkOS4Clone
-          path: |
-            build_out/*
-            libmali_bypass.so
+          path: libmali_bypass.so
